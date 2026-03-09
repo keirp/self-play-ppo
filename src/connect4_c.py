@@ -43,7 +43,7 @@ _lib.c4_ppo_update.argtypes = [
 _lib.c4_collect_games.restype = ctypes.c_int
 _lib.c4_collect_games.argtypes = [
     _f_ptr, _f_ptr,
-    ctypes.c_int, ctypes.c_float,
+    ctypes.c_int, ctypes.c_float, ctypes.c_float,
     _f_ptr, _ll_ptr, _f_ptr,
     _f_ptr, _f_ptr, _f_ptr, _f_ptr,
     _i_ptr,
@@ -183,23 +183,50 @@ class Connect4TrainerC:
         self.snapshot_interval = config.get("snapshot_interval", 25)
         self.snapshot_count = 1  # total snapshots seen (for reservoir sampling)
 
+        # Pinned opponents (never evicted by reservoir sampling)
+        self.pinned_opponents = []
+        pinned_paths = config.get("pinned_opponent_paths", [])
+        for path in pinned_paths:
+            p = np.load(path).astype(np.float32)
+            self.pinned_opponents.append(p)
+        # Fraction of games played against pinned opponents
+        self.pinned_frac = config.get("pinned_frac", 0.0)
+
         self.iteration = 0
         self.metrics_history = defaultdict(list)
+        self.best_elo = -float("inf")
+        self.best_params = None
 
-        # Pre-allocate buffers
+        # Pre-allocate buffers (2x for mirror augmentation)
         max_games = config.get("games_per_iter", 1024)
         max_trans = max_games * 22  # ~21 agent moves max per game
-        self.buf_obs = np.zeros((max_trans, INPUT_DIM), dtype=np.float32)
-        self.buf_actions = np.zeros(max_trans, dtype=np.int64)
-        self.buf_log_probs = np.zeros(max_trans, dtype=np.float32)
-        self.buf_values = np.zeros(max_trans, dtype=np.float32)
-        self.buf_valid_masks = np.zeros((max_trans, POLICY_DIM), dtype=np.float32)
-        self.buf_rewards = np.zeros(max_trans, dtype=np.float32)
-        self.buf_dones = np.zeros(max_trans, dtype=np.float32)
+        self.mirror_augment = config.get("mirror_augment", False)
+        buf_mult = 2 if self.mirror_augment else 1
+        self.buf_obs = np.zeros((max_trans * buf_mult, INPUT_DIM), dtype=np.float32)
+        self.buf_actions = np.zeros(max_trans * buf_mult, dtype=np.int64)
+        self.buf_log_probs = np.zeros(max_trans * buf_mult, dtype=np.float32)
+        self.buf_values = np.zeros(max_trans * buf_mult, dtype=np.float32)
+        self.buf_valid_masks = np.zeros((max_trans * buf_mult, POLICY_DIM), dtype=np.float32)
+        self.buf_rewards = np.zeros(max_trans * buf_mult, dtype=np.float32)
+        self.buf_dones = np.zeros(max_trans * buf_mult, dtype=np.float32)
         self.game_results = np.zeros(3, dtype=np.int32)
         self.stats_out = np.zeros(4, dtype=np.float32)
 
+        # Precompute mirror index for observations: swap columns in 6x7x3 layout
+        # obs layout: obs[row * 7 * 3 + col * 3 + ch] for row in 0..5, col in 0..6, ch in 0..2
+        self._mirror_obs_idx = np.zeros(INPUT_DIM, dtype=np.int32)
+        for r in range(6):
+            for c in range(7):
+                for ch in range(3):
+                    src = r * 7 * 3 + c * 3 + ch
+                    dst = r * 7 * 3 + (6 - c) * 3 + ch
+                    self._mirror_obs_idx[src] = dst
+
     def select_opponent(self):
+        # With probability pinned_frac, play against a pinned opponent
+        if self.pinned_opponents and random.random() < self.pinned_frac:
+            return random.choice(self.pinned_opponents)
+
         strategy = self.config.get("opponent_sampling", "uniform")
         if strategy == "uniform":
             idx = random.randint(0, len(self.opponent_pool) - 1)
@@ -248,29 +275,97 @@ class Connect4TrainerC:
         return results
 
     def train(self, num_iterations, eval_interval=25, verbose=True):
+        import math
         games_per_iter = self.config.get("games_per_iter", 1024)
         config = self.config
+        base_lr = config.get("lr", 3e-4)
+        lr_schedule = config.get("lr_schedule", "constant")  # "constant" or "cosine"
+        lr_min_frac = config.get("lr_min_frac", 0.1)  # minimum LR as fraction of base
+        base_ent = config.get("ent_coef", 0.01)
+        ent_schedule = config.get("ent_schedule", "constant")  # "constant" or "cosine"
+        ent_min_frac = config.get("ent_min_frac", 0.1)  # minimum ent_coef as fraction of base
 
         if verbose:
             log(f"Starting C4 training: {num_iterations} iters, {games_per_iter} games/iter, "
                 f"H={config.get('hidden_size',512)}, L={config.get('num_layers',4)}, "
-                f"params={self.total_params}")
+                f"params={self.total_params}, lr_schedule={lr_schedule}")
 
         for i in range(num_iterations):
             self.iteration += 1
             iter_start = time.time()
 
-            opp_params = self.select_opponent()
-            _lib.c4_seed(ctypes.c_ulong(random.getrandbits(64)))
+            progress = i / max(num_iterations - 1, 1)
 
-            n_trans = _lib.c4_collect_games(
-                _fp(self.params), _fp(opp_params),
-                games_per_iter, config.get("draw_reward", 0.0),
-                _fp(self.buf_obs), _llp(self.buf_actions), _fp(self.buf_log_probs),
-                _fp(self.buf_values), _fp(self.buf_valid_masks),
-                _fp(self.buf_rewards), _fp(self.buf_dones),
-                _ip(self.game_results),
-            )
+            # Compute learning rate
+            if lr_schedule == "cosine":
+                lr = base_lr * (lr_min_frac + (1 - lr_min_frac) * 0.5 * (1 + math.cos(math.pi * progress)))
+            else:
+                lr = base_lr
+
+            # Compute entropy coefficient
+            if ent_schedule == "cosine":
+                ent_coef = base_ent * (ent_min_frac + (1 - ent_min_frac) * 0.5 * (1 + math.cos(math.pi * progress)))
+            else:
+                ent_coef = base_ent
+
+            # Compute opponent temperature (for curriculum: start high, decay to 1.0)
+            base_opp_temp = config.get("opp_temperature", 1.0)
+            opp_temp_schedule = config.get("opp_temp_schedule", "constant")
+            if opp_temp_schedule == "cosine":
+                # Decay from base_opp_temp to 1.0
+                opp_temp = 1.0 + (base_opp_temp - 1.0) * 0.5 * (1 + math.cos(math.pi * progress))
+            else:
+                opp_temp = base_opp_temp
+
+            num_opps_per_iter = config.get("num_opps_per_iter", 1)
+            games_per_opp = games_per_iter // num_opps_per_iter
+            n_trans = 0
+            self.game_results[:] = 0
+            _tmp_gr = np.zeros(3, dtype=np.int32)
+
+            for opp_idx in range(num_opps_per_iter):
+                opp_params = self.select_opponent()
+                _lib.c4_seed(ctypes.c_ulong(random.getrandbits(64)))
+
+                nt = _lib.c4_collect_games(
+                    _fp(self.params), _fp(opp_params),
+                    games_per_opp, config.get("draw_reward", 0.0),
+                    opp_temp,
+                    _fp(self.buf_obs[n_trans:]), _llp(self.buf_actions[n_trans:]),
+                    _fp(self.buf_log_probs[n_trans:]),
+                    _fp(self.buf_values[n_trans:]), _fp(self.buf_valid_masks[n_trans:]),
+                    _fp(self.buf_rewards[n_trans:]), _fp(self.buf_dones[n_trans:]),
+                    _ip(_tmp_gr),
+                )
+                self.game_results += _tmp_gr
+                n_trans += nt
+
+            # Mirror augmentation: append left-right mirrored copies of all transitions
+            if self.mirror_augment and n_trans > 0:
+                n = n_trans
+                # Mirror observations: swap columns
+                self.buf_obs[n:2*n] = self.buf_obs[:n][:, self._mirror_obs_idx]
+                # Mirror actions: column c -> 6-c
+                self.buf_actions[n:2*n] = 6 - self.buf_actions[:n]
+                # Mirror valid masks: swap columns
+                self.buf_valid_masks[n:2*n] = self.buf_valid_masks[:n][:, ::-1]
+                # Compute CORRECT log_probs and values for mirrored obs/actions
+                # (can't reuse originals because policy isn't symmetric)
+                load_params(self.agent, self.params)
+                self.agent.eval()
+                with torch.no_grad():
+                    m_obs_t = torch.from_numpy(self.buf_obs[n:2*n].copy())
+                    m_mask_t = torch.from_numpy(self.buf_valid_masks[n:2*n].copy())
+                    m_act_t = torch.from_numpy(self.buf_actions[n:2*n].copy()).long()
+                    logits, values = self.agent(m_obs_t, m_mask_t)
+                    log_probs_all = torch.log_softmax(logits, dim=-1)
+                    m_log_probs = log_probs_all.gather(1, m_act_t.unsqueeze(1)).squeeze(1)
+                    self.buf_log_probs[n:2*n] = m_log_probs.numpy()
+                    self.buf_values[n:2*n] = values.numpy()
+                # Copy unchanged buffers (rewards and dones are the same)
+                self.buf_rewards[n:2*n] = self.buf_rewards[:n]
+                self.buf_dones[n:2*n] = self.buf_dones[:n]
+                n_trans = 2 * n
 
             _lib.c4_ppo_update(
                 _fp(self.params), _fp(self.adam_m), _fp(self.adam_v), _ip(self.adam_t),
@@ -279,7 +374,7 @@ class Connect4TrainerC:
                 _fp(self.buf_rewards), _fp(self.buf_dones), n_trans,
                 config.get("gamma", 0.99), config.get("gae_lambda", 0.95),
                 config.get("clip_eps", 0.2), config.get("vf_coef", 0.5),
-                config.get("ent_coef", 0.01), config.get("lr", 3e-4),
+                ent_coef, lr,
                 config.get("max_grad_norm", 0.5), config.get("ppo_epochs", 4),
                 config.get("batch_size", 256), _fp(self.stats_out),
             )
@@ -288,6 +383,7 @@ class Connect4TrainerC:
             gr = self.game_results
 
             self.metrics_history["iteration"].append(self.iteration)
+            self.metrics_history["lr"].append(lr)
             self.metrics_history["sp_win_rate"].append(gr[0] / games_per_iter)
             self.metrics_history["sp_draw_rate"].append(gr[1] / games_per_iter)
             self.metrics_history["sp_loss_rate"].append(gr[2] / games_per_iter)
@@ -320,11 +416,18 @@ class Connect4TrainerC:
 
             if self.iteration % eval_interval == 0:
                 eval_start = time.time()
-                eval_results = self.evaluate()
+                elo_gpo = config.get("elo_games_per_opp", 20)
+                eval_results = self.evaluate(elo_games_per_opp=elo_gpo)
                 eval_time = time.time() - eval_start
                 for key, val in eval_results.items():
                     self.metrics_history[key].append(val)
                 self.metrics_history["eval_iteration"].append(self.iteration)
+
+                # Track best checkpoint
+                if "elo" in eval_results and eval_results["elo"] > self.best_elo:
+                    self.best_elo = eval_results["elo"]
+                    self.best_params = self.params.copy()
+                    self.metrics_history["best_elo_iter"] = self.iteration
 
                 if verbose:
                     elo_str = f" Elo: {eval_results['elo']:.0f}" if "elo" in eval_results else ""

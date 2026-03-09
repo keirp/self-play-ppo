@@ -45,8 +45,8 @@ static int OFF_LN_FINAL_G, OFF_LN_FINAL_B;
 static int OFF_WP, OFF_BP, OFF_WV, OFF_BV;
 
 /* Max buffer sizes */
-#define MAX_BATCH 2048
-#define MAX_TRANS 65536
+#define MAX_BATCH 8192
+#define MAX_TRANS 131072
 
 /* Scratch memory */
 static float *act_pre_ln[MAX_LAYERS];   /* input to each block's LN (= residual) */
@@ -858,7 +858,7 @@ static void sample_actions(const float *logits, const float *values,
 /* ========== Game Collection ========== */
 
 int c4_collect_games(const float *agent_params, const float *opp_params,
-                      int num_games, float draw_reward,
+                      int num_games, float draw_reward, float opp_temperature,
                       float *out_obs, long long *out_actions, float *out_log_probs,
                       float *out_values, float *out_valid_masks,
                       float *out_rewards, float *out_dones,
@@ -952,8 +952,9 @@ int c4_collect_games(const float *agent_params, const float *opp_params,
                 const float *vm = g_vm + i*POLICY_DIM;
                 float mx = -1e30f;
                 float p[POLICY_DIM], s_val = 0;
+                float inv_temp = 1.0f / opp_temperature;
                 for (int j = 0; j < POLICY_DIM; j++) {
-                    float ml = vm[j] > 0.5f ? lg[j] : -1e8f;
+                    float ml = vm[j] > 0.5f ? lg[j] * inv_temp : -1e8f;
                     if (ml > mx) mx = ml;
                     p[j] = ml;
                 }
