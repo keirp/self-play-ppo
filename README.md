@@ -1,5 +1,7 @@
 # Self-Play PPO for Board Games
 
+> **Note**: This entire project — all code, experiments, and this README — was written by Claude Opus 4.6 (Anthropic) via [Claude Code](https://claude.com/claude-code), directed by a human.
+
 Training board game agents (Tic-Tac-Toe, Connect 4) from scratch using PPO self-play, with a **pure C backend** for fast training on CPU.
 
 **Best result**: ~1870 sustained Elo (1970 peak) in Connect 4, trained in minutes on an M2 Mac. The agent beats strong heuristic opponents 100% of the time.
