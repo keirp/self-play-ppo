@@ -49,6 +49,18 @@ _lib.c4_collect_games.argtypes = [
     _i_ptr,
 ]
 
+_lib.c4_collect_games_from_pos.restype = ctypes.c_int
+_lib.c4_collect_games_from_pos.argtypes = [
+    _f_ptr, _f_ptr,
+    ctypes.c_int, ctypes.c_float, ctypes.c_float,
+    _f_ptr, _f_ptr,  # start_boards, start_current_players
+    _f_ptr, _ll_ptr, _f_ptr,
+    _f_ptr, _f_ptr, _f_ptr, _f_ptr,
+    _i_ptr,
+    _f_ptr,  # out_agent_players
+    _i_ptr,  # out_trans_game_idx
+]
+
 INPUT_DIM = 126  # 6*7*3
 POLICY_DIM = 7
 
@@ -153,6 +165,36 @@ def log(msg):
     print(msg, flush=True)
 
 
+class ProblematicStatesBuffer:
+    """Circular buffer of (board, current_player) states from lost games."""
+
+    def __init__(self, max_size=10000):
+        self.max_size = max_size
+        self.boards = np.zeros((max_size, 42), dtype=np.float32)
+        self.current_players = np.zeros(max_size, dtype=np.float32)
+        self.count = 0
+        self.size = 0
+
+    def add_states(self, boards, current_players):
+        for i in range(len(boards)):
+            if self.size < self.max_size:
+                self.boards[self.size] = boards[i]
+                self.current_players[self.size] = current_players[i]
+                self.size += 1
+            else:
+                j = np.random.randint(0, self.count + 1)
+                if j < self.max_size:
+                    self.boards[j] = boards[i]
+                    self.current_players[j] = current_players[i]
+            self.count += 1
+
+    def sample(self, n):
+        if self.size == 0:
+            return None, None
+        indices = np.random.randint(0, self.size, size=n)
+        return self.boards[indices].copy(), self.current_players[indices].copy()
+
+
 class Connect4TrainerC:
     """Self-play PPO trainer for Connect 4 using pure C backend."""
 
@@ -212,6 +254,16 @@ class Connect4TrainerC:
         self.game_results = np.zeros(3, dtype=np.int32)
         self.stats_out = np.zeros(4, dtype=np.float32)
 
+        # Problematic starting positions
+        self.problematic_start_frac = config.get("problematic_start_frac", 0.0)
+        self.problematic_buffer = ProblematicStatesBuffer(
+            max_size=config.get("problematic_buffer_size", 10000)
+        )
+        self.buf_agent_players = np.zeros(max_games, dtype=np.float32)
+        self.buf_trans_game_idx = np.zeros(max_trans, dtype=np.int32)
+        self.buf_start_boards = np.zeros((max_games, 42), dtype=np.float32)
+        self.buf_start_cplayers = np.ones(max_games, dtype=np.float32)
+
         # Precompute mirror index for observations: swap columns in 6x7x3 layout
         # obs layout: obs[row * 7 * 3 + col * 3 + ch] for row in 0..5, col in 0..6, ch in 0..2
         self._mirror_obs_idx = np.zeros(INPUT_DIM, dtype=np.int32)
@@ -240,6 +292,46 @@ class Connect4TrainerC:
         else:
             idx = random.randint(0, len(self.opponent_pool) - 1)
         return self.opponent_pool[idx]
+
+    def _extract_problematic_states(self, buf_offset, n_trans, num_games):
+        """Extract board states from lost games where agent was overconfident.
+
+        Only stores states where value > 0.3 in games the agent lost — positions
+        where the agent thought it was winning but actually lost. These represent
+        fundamental misunderstandings in the agent's evaluation.
+        """
+        obs = self.buf_obs[buf_offset:buf_offset + n_trans]
+        values = self.buf_values[buf_offset:buf_offset + n_trans]
+        rewards = self.buf_rewards[buf_offset:buf_offset + n_trans]
+        dones = self.buf_dones[buf_offset:buf_offset + n_trans]
+        tgi = self.buf_trans_game_idx[:n_trans]
+
+        # Build per-game outcome map
+        game_outcome = {}
+        for i in range(n_trans):
+            if dones[i] > 0.5:
+                game_outcome[tgi[i]] = rewards[i]
+
+        outcomes = np.array([game_outcome.get(tgi[i], 0) for i in range(n_trans)])
+        lost = outcomes < -0.5
+
+        # Select states where agent was overconfident (V > 0.3) but lost
+        mask = lost & (values > 0.3)
+        indices = np.where(mask)[0]
+
+        if len(indices) == 0:
+            return
+
+        sel_obs = obs[indices]
+        sel_game_ids = tgi[indices]
+
+        my_pieces = sel_obs[:, 0::3]
+        opp_pieces = sel_obs[:, 1::3]
+        ap = self.buf_agent_players[sel_game_ids]
+        ap_col = ap.reshape(-1, 1)
+
+        boards = my_pieces * ap_col + opp_pieces * (-ap_col)
+        self.problematic_buffer.add_states(boards, ap.copy())
 
     def evaluate(self, num_games=100, compute_elo=True, elo_games_per_opp=20):
         load_params(self.agent, self.params)
@@ -327,17 +419,36 @@ class Connect4TrainerC:
                 opp_params = self.select_opponent()
                 _lib.c4_seed(ctypes.c_ulong(random.getrandbits(64)))
 
-                nt = _lib.c4_collect_games(
+                # Prepare starting positions
+                n_prob = 0
+                if self.problematic_start_frac > 0 and self.problematic_buffer.size > 0:
+                    n_prob = int(games_per_opp * self.problematic_start_frac)
+
+                self.buf_start_boards[:games_per_opp] = 0.0
+                self.buf_start_cplayers[:games_per_opp] = 1.0
+                if n_prob > 0:
+                    prob_boards, prob_cplayers = self.problematic_buffer.sample(n_prob)
+                    self.buf_start_boards[:n_prob] = prob_boards
+                    self.buf_start_cplayers[:n_prob] = prob_cplayers
+
+                nt = _lib.c4_collect_games_from_pos(
                     _fp(self.params), _fp(opp_params),
                     games_per_opp, config.get("draw_reward", 0.0),
                     opp_temp,
+                    _fp(self.buf_start_boards), _fp(self.buf_start_cplayers),
                     _fp(self.buf_obs[n_trans:]), _llp(self.buf_actions[n_trans:]),
                     _fp(self.buf_log_probs[n_trans:]),
                     _fp(self.buf_values[n_trans:]), _fp(self.buf_valid_masks[n_trans:]),
                     _fp(self.buf_rewards[n_trans:]), _fp(self.buf_dones[n_trans:]),
                     _ip(_tmp_gr),
+                    _fp(self.buf_agent_players), _ip(self.buf_trans_game_idx),
                 )
                 self.game_results += _tmp_gr
+
+                # Extract problematic states from lost games
+                if self.problematic_start_frac > 0 and nt > 0:
+                    self._extract_problematic_states(n_trans, nt, games_per_opp)
+
                 n_trans += nt
 
             # Mirror augmentation: append left-right mirrored copies of all transitions

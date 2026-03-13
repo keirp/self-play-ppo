@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Self-Play PPO Agent</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0a1a;
+    color: #e0e0e0;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    overflow-x: hidden;
+  }
+
+  .header {
+    text-align: center;
+    padding: 20px 0 10px;
+  }
+  .header h1 {
+    font-size: 24px;
+    font-weight: 300;
+    letter-spacing: 2px;
+    color: #7eb8ff;
+  }
+  .header .subtitle {
+    font-size: 13px;
+    color: #667;
+    margin-top: 4px;
+  }
+
+  .game-selector {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    margin: 12px 0;
+  }
+  .game-selector button {
+    padding: 8px 20px;
+    font-size: 14px;
+  }
+  .game-selector button.active {
+    background: #2a2a5a;
+    border-color: #7eb8ff;
+  }
+
+  .main-container {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    gap: 40px;
+    padding: 20px 30px;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+
+  .game-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 320px;
+  }
+
+  .status-bar {
+    font-size: 16px;
+    margin-bottom: 16px;
+    height: 24px;
+    color: #aac;
+    font-weight: 300;
+  }
+  .status-bar.win { color: #4caf50; }
+  .status-bar.lose { color: #f44336; }
+  .status-bar.draw { color: #ff9800; }
+
+  /* Tic-tac-toe board */
+  .board-ttt {
+    display: grid;
+    grid-template-columns: repeat(3, 100px);
+    grid-template-rows: repeat(3, 100px);
+    gap: 4px;
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 8px;
+    box-shadow: 0 0 40px rgba(100, 140, 255, 0.08);
+  }
+
+  /* Connect 4 board */
+  .board-c4 {
+    display: grid;
+    grid-template-columns: repeat(7, 68px);
+    grid-template-rows: repeat(6, 68px);
+    gap: 4px;
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 8px;
+    box-shadow: 0 0 40px rgba(100, 140, 255, 0.08);
+  }
+
+  /* Column indicators for Connect 4 */
+  .col-indicators {
+    display: grid;
+    grid-template-columns: repeat(7, 68px);
+    gap: 4px;
+    padding: 0 8px;
+    margin-bottom: 4px;
+  }
+  .col-indicator {
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    color: #556;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.15s;
+  }
+  .col-indicator:hover:not(.game-over) {
+    background: #1a1a3e;
+    color: #7eb8ff;
+  }
+  .col-indicator.full { cursor: default; opacity: 0.3; }
+
+  .cell {
+    width: 100%;
+    height: 100%;
+    background: #12122a;
+    border: 1px solid #2a2a4a;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 42px;
+    font-weight: 200;
+    cursor: pointer;
+    transition: all 0.15s;
+    position: relative;
+  }
+  .cell:hover:not(.taken):not(.game-over) {
+    background: #1a1a3e;
+    border-color: #4a4a7a;
+    transform: scale(1.03);
+  }
+  .cell.taken { cursor: default; }
+  .cell .x { color: #7eb8ff; }
+  .cell .o { color: #ff7eb8; }
+
+  /* Connect 4 disc styling */
+  .cell .disc {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+  }
+  .cell .disc.p1 { background: radial-gradient(circle at 35% 35%, #ff6b6b, #c0392b); }
+  .cell .disc.p2 { background: radial-gradient(circle at 35% 35%, #f1c40f, #d4a00a); }
+
+  .cell .prob-overlay {
+    position: absolute;
+    bottom: 4px;
+    right: 6px;
+    font-size: 10px;
+    color: #556;
+    font-weight: 400;
+  }
+  .cell .prob-bar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #7eb8ff44, #7eb8ff);
+    border-radius: 0 0 8px 8px;
+    transition: width 0.3s;
+  }
+
+  .controls {
+    margin-top: 20px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+
+  button {
+    background: #1a1a3e;
+    color: #7eb8ff;
+    border: 1px solid #3a3a6a;
+    padding: 10px 24px;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  button:hover {
+    background: #2a2a5a;
+    border-color: #5a5a9a;
+  }
+
+  .side-selector {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .side-selector button.active {
+    background: #2a2a5a;
+    border-color: #7eb8ff;
+  }
+
+  .value-display {
+    margin-top: 16px;
+    text-align: center;
+  }
+  .value-display .label {
+    font-size: 11px;
+    color: #556;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .value-display .value {
+    font-size: 28px;
+    font-weight: 200;
+    color: #7eb8ff;
+    margin-top: 2px;
+  }
+
+  .nn-panel {
+    flex: 1;
+    min-width: 900px;
+    max-width: 1200px;
+  }
+
+  .nn-title {
+    font-size: 14px;
+    color: #556;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+    text-align: center;
+  }
+
+  .nn-container {
+    background: #0d0d20;
+    border-radius: 16px;
+    border: 1px solid #1a1a3a;
+    padding: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  canvas#nnCanvas {
+    display: block;
+    width: 100%;
+  }
+
+  .nn-legend {
+    display: flex;
+    justify-content: center;
+    gap: 24px;
+    margin-top: 12px;
+    font-size: 11px;
+    color: #556;
+  }
+  .nn-legend .item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .nn-legend .swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+  }
+
+  .score-bar {
+    margin-top: 16px;
+    display: flex;
+    justify-content: center;
+    gap: 24px;
+    font-size: 13px;
+    color: #778;
+  }
+  .score-bar span { font-weight: 600; color: #aac; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1 id="titleText">TIC-TAC-TOE vs SELF-PLAY PPO</h1>
+  <div class="subtitle">Neural network trained via self-play with PPO against historical opponents</div>
+</div>
+
+<div class="game-selector">
+  <button id="btnTTT" class="active" onclick="switchGame('ttt')">Tic-Tac-Toe</button>
+  <button id="btnC4" onclick="switchGame('c4')">Connect 4</button>
+</div>
+
+<div class="main-container">
+  <div class="game-panel">
+    <div class="status-bar" id="status">Your turn</div>
+
+    <div id="colIndicators" style="display:none"></div>
+    <div id="board"></div>
+
+    <div class="controls">
+      <button onclick="resetGame()">New Game</button>
+    </div>
+
+    <div class="side-selector">
+      <button id="btnFirst" class="active" onclick="setSide(1)">Play First</button>
+      <button id="btnSecond" onclick="setSide(-1)">Play Second</button>
+    </div>
+
+    <div class="value-display">
+      <div class="label">AI Value Estimate</div>
+      <div class="value" id="valueDisplay">--</div>
+    </div>
+
+    <div class="score-bar">
+      You: <span id="humanScore">0</span> &nbsp;|&nbsp;
+      AI: <span id="aiScore">0</span> &nbsp;|&nbsp;
+      Draws: <span id="drawScore">0</span>
+    </div>
+  </div>
+
+  <div class="nn-panel">
+    <div class="nn-title">Neural Network Activations</div>
+    <div class="nn-container">
+      <canvas id="nnCanvas" width="1200" height="900"></canvas>
+    </div>
+    <div class="nn-legend">
+      <div class="item"><div class="swatch" style="background:#4caf50"></div> Positive activation</div>
+      <div class="item"><div class="swatch" style="background:#f44336"></div> Negative activation</div>
+      <div class="item"><div class="swatch" style="background:#7eb8ff"></div> Policy output</div>
+      <div class="item"><div class="swatch" style="background:#ff9800"></div> Value output</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// =====================================================
+// GAME CONFIG
+// =====================================================
+let currentGame = 'ttt'; // 'ttt' or 'c4'
+
+const GAME_CONFIG = {
+  ttt: {
+    rows: 3, cols: 3, boardSize: 9, actionSize: 9,
+    title: 'TIC-TAC-TOE vs SELF-PLAY PPO',
+    apiPrefix: '/api',
+    // NN layer sizes: 27 input, 4x256 hidden, 10 output (9 policy + 1 value)
+    layerSizes: [27, 256, 256, 256, 256, 10],
+    layerLabels: ['Input (27)', 'Hidden 1', 'Hidden 2', 'Hidden 3', 'Hidden 4', 'Output (9+1)'],
+  },
+  c4: {
+    rows: 6, cols: 7, boardSize: 42, actionSize: 7,
+    title: 'CONNECT 4 vs SELF-PLAY PPO',
+    apiPrefix: '/api/c4',
+    // NN layer sizes: 126 input, 6x256 hidden, 8 output (7 policy + 1 value)
+    layerSizes: [126, 256, 256, 256, 256, 256, 256, 8],
+    layerLabels: ['Input (126)', 'Hidden 1', 'Hidden 2', 'Hidden 3', 'Hidden 4', 'Hidden 5', 'Hidden 6', 'Output (7+1)'],
+  },
+};
+
+// =====================================================
+// GAME STATE
+// =====================================================
+let board = [];
+let humanPlayer = 1;
+let aiPlayer = -1;
+let gameOver = false;
+let currentActivations = null;
+let scores = { human: 0, ai: 0, draw: 0 };
+
+function cfg() { return GAME_CONFIG[currentGame]; }
+
+// =====================================================
+// GAME SWITCHING
+// =====================================================
+function switchGame(game) {
+  if (game === currentGame) return;
+  currentGame = game;
+  document.getElementById('btnTTT').className = game === 'ttt' ? 'active' : '';
+  document.getElementById('btnC4').className = game === 'c4' ? 'active' : '';
+  document.getElementById('titleText').textContent = cfg().title;
+  scores = { human: 0, ai: 0, draw: 0 };
+  updateScores();
+  humanPlayer = 1;
+  aiPlayer = -1;
+  document.getElementById('btnFirst').className = 'active';
+  document.getElementById('btnSecond').className = '';
+  resetGame();
+}
+
+// =====================================================
+// BOARD RENDERING
+// =====================================================
+function renderBoard() {
+  const boardEl = document.getElementById('board');
+  const colInd = document.getElementById('colIndicators');
+
+  if (currentGame === 'ttt') {
+    boardEl.className = 'board-ttt';
+    colInd.style.display = 'none';
+    boardEl.innerHTML = '';
+
+    for (let i = 0; i < 9; i++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell' + (board[i] !== 0 ? ' taken' : '') + (gameOver ? ' game-over' : '');
+      if (board[i] !== 0) {
+        const span = document.createElement('span');
+        span.className = board[i] === 1 ? 'x' : 'o';
+        span.textContent = board[i] === 1 ? 'X' : 'O';
+        cell.appendChild(span);
+      }
+      if (board[i] === 0 && currentActivations && !gameOver) {
+        const p = currentActivations.probabilities[i];
+        if (p > 0.001) {
+          const bar = document.createElement('div');
+          bar.className = 'prob-bar';
+          bar.style.width = (p * 100) + '%';
+          cell.appendChild(bar);
+          const label = document.createElement('div');
+          label.className = 'prob-overlay';
+          label.textContent = (p * 100).toFixed(1) + '%';
+          cell.appendChild(label);
+        }
+      }
+      cell.addEventListener('click', () => handleCellClick(i));
+      boardEl.appendChild(cell);
+    }
+  } else {
+    // Connect 4
+    boardEl.className = 'board-c4';
+    colInd.style.display = 'grid';
+    colInd.className = 'col-indicators';
+    colInd.innerHTML = '';
+
+    // Column indicators with probabilities
+    for (let c = 0; c < 7; c++) {
+      const ind = document.createElement('div');
+      const isFull = board[(C4_ROWS - 1) * 7 + c] !== 0;
+      ind.className = 'col-indicator' + (isFull ? ' full' : '') + (gameOver ? ' game-over' : '');
+      if (currentActivations && !gameOver && !isFull) {
+        const p = currentActivations.probabilities[c];
+        ind.textContent = (p * 100).toFixed(1) + '%';
+        if (p > 0.15) ind.style.color = '#7eb8ff';
+      } else {
+        ind.textContent = '\u25BC';
+      }
+      ind.addEventListener('click', () => handleC4Click(c));
+      colInd.appendChild(ind);
+    }
+
+    boardEl.innerHTML = '';
+    // Render rows top-to-bottom (row 5 at top, row 0 at bottom)
+    for (let r = C4_ROWS - 1; r >= 0; r--) {
+      for (let c = 0; c < 7; c++) {
+        const idx = r * 7 + c;
+        const cell = document.createElement('div');
+        cell.className = 'cell' + (board[idx] !== 0 ? ' taken' : '') + (gameOver ? ' game-over' : '');
+        cell.style.fontSize = '0';
+        if (board[idx] !== 0) {
+          const disc = document.createElement('div');
+          disc.className = 'disc ' + (board[idx] === 1 ? 'p1' : 'p2');
+          cell.appendChild(disc);
+        }
+        cell.addEventListener('click', () => handleC4Click(c));
+        boardEl.appendChild(cell);
+      }
+    }
+  }
+}
+
+const C4_ROWS = 6;
+
+// =====================================================
+// GAME LOGIC
+// =====================================================
+async function handleCellClick(index) {
+  if (currentGame !== 'ttt') return;
+  if (gameOver || board[index] !== 0) return;
+
+  const filledCount = board.filter(v => v !== 0).length;
+  const currentPlayer = filledCount % 2 === 0 ? 1 : -1;
+  if (currentPlayer !== humanPlayer) return;
+
+  await makeMove(index);
+}
+
+async function handleC4Click(col) {
+  if (currentGame !== 'c4') return;
+  if (gameOver) return;
+  // Check column not full
+  if (board[(C4_ROWS - 1) * 7 + col] !== 0) return;
+
+  // Check it's human's turn
+  const filledCount = board.filter(v => v !== 0).length;
+  const currentPlayer = filledCount % 2 === 0 ? 1 : -1;
+  if (currentPlayer !== humanPlayer) return;
+
+  await makeMove(col);
+}
+
+async function makeMove(action) {
+  setStatus('AI thinking...');
+  try {
+    const resp = await fetch(cfg().apiPrefix + '/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        board: board,
+        action: action,
+        human_player: humanPlayer,
+      }),
+    });
+    const data = await resp.json();
+    board = data.board;
+    currentActivations = data.activations;
+    gameOver = data.done;
+
+    renderBoard();
+    drawNN();
+
+    if (data.activations) {
+      document.getElementById('valueDisplay').textContent =
+        data.activations.value.toFixed(3);
+    }
+
+    if (gameOver) {
+      if (data.winner === humanPlayer) {
+        setStatus('You win!', 'win');
+        scores.human++;
+      } else if (data.winner === aiPlayer) {
+        setStatus('AI wins!', 'lose');
+        scores.ai++;
+      } else {
+        setStatus('Draw!', 'draw');
+        scores.draw++;
+      }
+      updateScores();
+    } else {
+      setStatus('Your turn');
+    }
+  } catch (e) {
+    setStatus('Error: ' + e.message);
+  }
+}
+
+function setStatus(text, cls) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = 'status-bar' + (cls ? ' ' + cls : '');
+}
+
+function updateScores() {
+  document.getElementById('humanScore').textContent = scores.human;
+  document.getElementById('aiScore').textContent = scores.ai;
+  document.getElementById('drawScore').textContent = scores.draw;
+}
+
+async function resetGame() {
+  board = Array(cfg().boardSize).fill(0);
+  gameOver = false;
+  currentActivations = null;
+  document.getElementById('valueDisplay').textContent = '--';
+
+  if (humanPlayer === -1) {
+    setStatus('AI thinking...');
+    renderBoard();
+    try {
+      const resp = await fetch(cfg().apiPrefix + '/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          board: Array(cfg().boardSize).fill(0),
+          action: -1,
+          human_player: humanPlayer,
+        }),
+      });
+      const data = await resp.json();
+      board = data.board;
+      currentActivations = data.activations;
+      renderBoard();
+      drawNN();
+      if (data.activations) {
+        document.getElementById('valueDisplay').textContent =
+          data.activations.value.toFixed(3);
+      }
+      setStatus('Your turn');
+    } catch (e) {
+      setStatus('Error: ' + e.message);
+    }
+  } else {
+    setStatus('Your turn');
+    try {
+      const resp = await fetch(cfg().apiPrefix + '/activations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ board: Array(cfg().boardSize).fill(0), perspective_player: aiPlayer }),
+      });
+      const data = await resp.json();
+      currentActivations = data.activations;
+      renderBoard();
+      drawNN();
+    } catch(e) {}
+  }
+}
+
+function setSide(player) {
+  humanPlayer = player;
+  aiPlayer = -player;
+  document.getElementById('btnFirst').className = player === 1 ? 'active' : '';
+  document.getElementById('btnSecond').className = player === -1 ? 'active' : '';
+  resetGame();
+}
+
+// =====================================================
+// NEURAL NETWORK VISUALIZER
+// =====================================================
+const canvas = document.getElementById('nnCanvas');
+const ctx = canvas.getContext('2d');
+
+function getLayerSizes() { return cfg().layerSizes; }
+function getLayerLabels() { return cfg().layerLabels; }
+
+function getActivationValues() {
+  if (!currentActivations) return null;
+  const acts = currentActivations.activations;
+  const sizes = getLayerSizes();
+  const numLayers = sizes.length;
+
+  // acts contains: input, then for each trunk layer: linear output, relu output
+  // We want: input, relu1, relu2, ..., reluN, [policy_probs + value]
+  const result = [acts[0]]; // input
+
+  // Trunk has (numLayers - 2) hidden layers, each produces linear + relu = 2 entries
+  const numHidden = numLayers - 2;
+  for (let i = 0; i < numHidden; i++) {
+    // relu output is at index 2*(i+1), linear at 2*i+1
+    const reluIdx = 2 * (i + 1);
+    const linIdx = 2 * i + 1;
+    result.push(acts[reluIdx] || acts[linIdx]);
+  }
+
+  // Output: policy probs + value
+  result.push([...currentActivations.probabilities, currentActivations.value]);
+  return result;
+}
+
+function drawNN() {
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const LAYER_SIZES = getLayerSizes();
+  const LAYER_LABELS = getLayerLabels();
+  const numLayers = LAYER_SIZES.length;
+  const marginLeft = 90;
+  const marginRight = 100;
+  const marginTop = 10;
+  const marginBottom = 30;
+  const usableW = W - marginLeft - marginRight;
+  const usableH = H - marginTop - marginBottom;
+  const layerSpacing = usableW / (numLayers - 1);
+
+  const activationValues = getActivationValues();
+
+  const layerPositions = [];
+  for (let l = 0; l < numLayers; l++) {
+    const x = marginLeft + l * layerSpacing;
+    const n = LAYER_SIZES[l];
+    const gap = usableH / n;
+    const positions = [];
+    for (let i = 0; i < n; i++) {
+      positions.push({ x, y: marginTop + gap * i + gap / 2 });
+    }
+    layerPositions.push(positions);
+  }
+
+  // Draw connections
+  const connCanvas = document.createElement('canvas');
+  connCanvas.width = W;
+  connCanvas.height = H;
+  const cc = connCanvas.getContext('2d');
+
+  for (let l = 0; l < numLayers - 1; l++) {
+    const fromPos = layerPositions[l];
+    const toPos = layerPositions[l + 1];
+    const fromN = LAYER_SIZES[l];
+    const toN = LAYER_SIZES[l + 1];
+    const maxConns = 2000;
+    const totalConns = fromN * toN;
+
+    cc.lineWidth = 0.4;
+
+    for (let i = 0; i < fromN; i++) {
+      const fp = fromPos[i];
+      const actualJStep = totalConns > maxConns ? Math.ceil(toN / Math.ceil(maxConns / fromN)) : 1;
+
+      for (let j = 0; j < toN; j += actualJStep) {
+        const tp = toPos[j];
+        let alpha = 0.015;
+        let r = 100, g = 120, b = 180;
+
+        if (activationValues) {
+          const fv = activationValues[l][i] || 0;
+          const tv = activationValues[l + 1][j] || 0;
+          const product = fv * tv;
+          const strength = Math.abs(product);
+          alpha = Math.min(0.15, strength * 0.3 + 0.005);
+          if (product > 0) { r = 78; g = 175; b = 80; }
+          else if (product < 0) { r = 244; g = 67; b = 54; }
+        }
+
+        cc.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+        cc.beginPath();
+        cc.moveTo(fp.x, fp.y);
+        cc.lineTo(tp.x, tp.y);
+        cc.stroke();
+      }
+    }
+  }
+
+  ctx.drawImage(connCanvas, 0, 0);
+
+  // Draw neurons
+  for (let l = 0; l < numLayers; l++) {
+    const n = LAYER_SIZES[l];
+    const positions = layerPositions[l];
+    const isOutput = l === numLayers - 1;
+    const isInput = l === 0;
+    const gap = usableH / n;
+    let baseRadius = Math.max(1, Math.min(6, gap * 0.4));
+    if (isOutput) baseRadius = 8;
+    if (isInput) baseRadius = Math.max(2, Math.min(7, gap * 0.35));
+
+    for (let i = 0; i < n; i++) {
+      const pos = positions[i];
+      let radius = baseRadius;
+      let fillColor = '#1a1a3e';
+      let strokeColor = '#2a2a4a';
+      let glowColor = null;
+
+      if (activationValues) {
+        const val = activationValues[l][i] || 0;
+
+        if (isOutput) {
+          const actionSize = cfg().actionSize;
+          if (i < actionSize) {
+            const prob = val;
+            radius = 5 + prob * 14;
+            fillColor = `rgba(126,184,255,${0.15 + prob * 0.85})`;
+            strokeColor = `rgba(126,184,255,${0.4 + prob * 0.6})`;
+            if (prob > 0.25) glowColor = `rgba(126,184,255,${prob * 0.35})`;
+          } else {
+            radius = 10;
+            const hue = val > 0 ? '255,152,0' : '156,39,176';
+            fillColor = `rgba(${hue},${0.3 + Math.abs(val) * 0.7})`;
+            strokeColor = `rgba(${hue},0.8)`;
+            glowColor = `rgba(${hue},0.25)`;
+          }
+        } else {
+          const absVal = Math.min(Math.abs(val), 3) / 3;
+          const scaledR = baseRadius * (0.6 + absVal * 1.2);
+          radius = Math.max(0.8, scaledR);
+          if (val > 0.01) {
+            fillColor = `rgba(78,175,80,${0.15 + absVal * 0.85})`;
+            strokeColor = `rgba(78,175,80,${0.2 + absVal * 0.6})`;
+          } else if (val < -0.01) {
+            fillColor = `rgba(244,67,54,${0.15 + absVal * 0.85})`;
+            strokeColor = `rgba(244,67,54,${0.2 + absVal * 0.6})`;
+          } else {
+            fillColor = 'rgba(40,40,70,0.4)';
+            strokeColor = 'rgba(60,60,100,0.3)';
+          }
+        }
+      }
+
+      if (glowColor) {
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, radius + 6, 0, Math.PI * 2);
+        ctx.fillStyle = glowColor;
+        ctx.fill();
+      }
+
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+      ctx.fillStyle = fillColor;
+      ctx.fill();
+      if (radius > 1.5) {
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = radius > 3 ? 1 : 0.5;
+        ctx.stroke();
+      }
+    }
+
+    // Layer label
+    ctx.fillStyle = '#556';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(LAYER_LABELS[l], layerPositions[l][0].x, H - 8);
+  }
+
+  // Output labels
+  if (activationValues) {
+    const outPos = layerPositions[numLayers - 1];
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    const actionSize = cfg().actionSize;
+
+    if (currentGame === 'ttt') {
+      const moveNames = ['TL','TC','TR','ML','MC','MR','BL','BC','BR'];
+      for (let i = 0; i < actionSize; i++) {
+        const pos = outPos[i];
+        const prob = activationValues[numLayers - 1][i];
+        const label = `${moveNames[i]} ${(prob*100).toFixed(1)}%`;
+        ctx.fillStyle = prob > 0.1 ? '#7eb8ff' : '#445';
+        ctx.fillText(label, pos.x + 14, pos.y + 4);
+      }
+    } else {
+      for (let i = 0; i < actionSize; i++) {
+        const pos = outPos[i];
+        const prob = activationValues[numLayers - 1][i];
+        const label = `Col ${i} ${(prob*100).toFixed(1)}%`;
+        ctx.fillStyle = prob > 0.1 ? '#7eb8ff' : '#445';
+        ctx.fillText(label, pos.x + 14, pos.y + 4);
+      }
+    }
+
+    const vPos = outPos[actionSize];
+    const v = activationValues[numLayers - 1][actionSize];
+    ctx.fillStyle = '#ff9800';
+    ctx.font = '11px monospace';
+    ctx.fillText(`V = ${v.toFixed(3)}`, vPos.x + 14, vPos.y + 4);
+  }
+
+  // Input labels (only for TTT — C4 has 126 inputs, too many for labels)
+  if (activationValues && currentGame === 'ttt') {
+    const inPos = layerPositions[0];
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'right';
+    const channelNames = ['My', 'Op', 'Bi'];
+    const cellNames = ['0,0','0,1','0,2','1,0','1,1','1,2','2,0','2,1','2,2'];
+    for (let i = 0; i < 27; i++) {
+      const pos = inPos[i];
+      const ch = Math.floor(i / 9);
+      const cell = i % 9;
+      const val = activationValues[0][i];
+      ctx.fillStyle = val > 0.5 ? '#8a8' : '#334';
+      ctx.fillText(`${channelNames[ch]}[${cellNames[cell]}]`, pos.x - 6, pos.y + 3);
+    }
+  }
+}
+
+// =====================================================
+// INIT
+// =====================================================
+renderBoard();
+drawNN();
+resetGame();
+</script>
+</body>
+</html>

@@ -1038,3 +1038,240 @@ int c4_collect_games(const float *agent_params, const float *opp_params,
 
     return trans_count;
 }
+
+/* ========== Game Collection from Arbitrary Starting Positions ========== */
+
+int c4_collect_games_from_pos(const float *agent_params, const float *opp_params,
+                               int num_games, float draw_reward, float opp_temperature,
+                               const float *start_boards,
+                               const float *start_current_players,
+                               float *out_obs, long long *out_actions, float *out_log_probs,
+                               float *out_values, float *out_valid_masks,
+                               float *out_rewards, float *out_dones,
+                               int *out_game_results,
+                               float *out_agent_players,
+                               int *out_trans_game_idx) {
+    /* Initialize boards from starting positions */
+    memcpy(board_buf, start_boards, num_games * BOARD_SIZE * sizeof(float));
+
+    /* Compute column heights from board state */
+    for (int i = 0; i < num_games; i++) {
+        float *bd = board_buf + i * BOARD_SIZE;
+        int *ch = col_height_buf + i * BOARD_COLS;
+        for (int c = 0; c < BOARD_COLS; c++) {
+            int h = 0;
+            for (int r = 0; r < BOARD_ROWS; r++) {
+                if (bd[r * BOARD_COLS + c] != 0.0f)
+                    h = r + 1;
+            }
+            ch[c] = h;
+        }
+    }
+
+    /* Set current players */
+    for (int i = 0; i < num_games; i++)
+        cplayer_buf[i] = start_current_players[i];
+
+    /* Randomly assign agent to player 1 or -1 */
+    for (int i = 0; i < num_games; i++) {
+        agent_player_buf[i] = rng_float() < 0.5f ? 1.0f : -1.0f;
+        out_agent_players[i] = agent_player_buf[i];
+    }
+
+    memset(done_buf_g, 0, num_games * sizeof(int));
+    memset(winner_buf, 0, num_games * sizeof(float));
+    memset(game_trans_count, 0, num_games * sizeof(int));
+    int trans_count = 0;
+    int games_remaining = num_games;
+
+    /* Check for already-terminal starting positions */
+    for (int i = 0; i < num_games; i++) {
+        /* Check if board is full */
+        int full = 1;
+        int *ch = col_height_buf + i * BOARD_COLS;
+        for (int c = 0; c < BOARD_COLS; c++)
+            if (ch[c] < BOARD_ROWS) { full = 0; break; }
+        if (full) {
+            done_buf_g[i] = 1;
+            winner_buf[i] = 0;
+            games_remaining--;
+            continue;
+        }
+        /* Check if there's already a win on the board */
+        float *bd = board_buf + i * BOARD_SIZE;
+        int found_win = 0;
+        for (int r = 0; r < BOARD_ROWS && !found_win; r++) {
+            for (int c = 0; c < BOARD_COLS && !found_win; c++) {
+                float p = bd[r * BOARD_COLS + c];
+                if (p != 0.0f && check_win_at(bd, r, c, p)) {
+                    done_buf_g[i] = 1;
+                    winner_buf[i] = p;
+                    games_remaining--;
+                    found_win = 1;
+                }
+            }
+        }
+    }
+
+    int agent_idx[MAX_BATCH], opp_idx[MAX_BATCH];
+    int agent_actions[MAX_BATCH], opp_actions[MAX_BATCH];
+    float agent_lp[MAX_BATCH], agent_val[MAX_BATCH];
+
+    static float gp_obs[MAX_BATCH * INPUT_DIM];
+    static float gp_vm[MAX_BATCH * POLICY_DIM];
+    static float gp_logits[MAX_BATCH * POLICY_DIM];
+    static float gp_values[MAX_BATCH];
+    int move_col[MAX_BATCH];
+
+    while (games_remaining > 0) {
+        int n_agent = 0, n_opp = 0;
+        for (int i = 0; i < num_games; i++) {
+            if (done_buf_g[i]) continue;
+
+            float cp = cplayer_buf[i];
+            float *ob = obs_buf + i*INPUT_DIM;
+            float *bd = board_buf + i*BOARD_SIZE;
+
+            for (int j = 0; j < BOARD_SIZE; j++) {
+                ob[j*3]   = (bd[j] == cp)  ? 1.0f : 0.0f;
+                ob[j*3+1] = (bd[j] == -cp) ? 1.0f : 0.0f;
+                ob[j*3+2] = 1.0f;
+            }
+
+            int *ch = col_height_buf + i*BOARD_COLS;
+            for (int c = 0; c < BOARD_COLS; c++)
+                vmask_buf[i*POLICY_DIM + c] = (ch[c] < BOARD_ROWS) ? 1.0f : 0.0f;
+
+            if (cp == agent_player_buf[i])
+                agent_idx[n_agent++] = i;
+            else
+                opp_idx[n_opp++] = i;
+        }
+
+        if (n_agent > 0) {
+            for (int i = 0; i < n_agent; i++) {
+                memcpy(gp_obs + i*INPUT_DIM, obs_buf + agent_idx[i]*INPUT_DIM, INPUT_DIM*sizeof(float));
+                memcpy(gp_vm + i*POLICY_DIM, vmask_buf + agent_idx[i]*POLICY_DIM, POLICY_DIM*sizeof(float));
+            }
+            forward_infer(agent_params, gp_obs, n_agent, gp_logits, gp_values);
+            sample_actions(gp_logits, gp_values, gp_vm, n_agent,
+                           agent_actions, agent_lp, agent_val);
+
+            for (int i = 0; i < n_agent; i++) {
+                int gi = agent_idx[i];
+                int tc = trans_count++;
+                memcpy(tmp_obs + tc*INPUT_DIM, gp_obs + i*INPUT_DIM, INPUT_DIM*sizeof(float));
+                tmp_actions[tc] = agent_actions[i];
+                tmp_log_probs[tc] = agent_lp[i];
+                tmp_values[tc] = agent_val[i];
+                memcpy(tmp_valid_masks + tc*POLICY_DIM, gp_vm + i*POLICY_DIM, POLICY_DIM*sizeof(float));
+                game_trans_idx[gi][game_trans_count[gi]++] = tc;
+
+                int col = agent_actions[i];
+                int row = col_height_buf[gi*BOARD_COLS + col];
+                board_buf[gi*BOARD_SIZE + row*BOARD_COLS + col] = cplayer_buf[gi];
+                col_height_buf[gi*BOARD_COLS + col]++;
+                move_col[gi] = col;
+            }
+        }
+
+        if (n_opp > 0) {
+            for (int i = 0; i < n_opp; i++) {
+                memcpy(gp_obs + i*INPUT_DIM, obs_buf + opp_idx[i]*INPUT_DIM, INPUT_DIM*sizeof(float));
+                memcpy(gp_vm + i*POLICY_DIM, vmask_buf + opp_idx[i]*POLICY_DIM, POLICY_DIM*sizeof(float));
+            }
+            forward_infer(opp_params, gp_obs, n_opp, gp_logits, gp_values);
+
+            for (int i = 0; i < n_opp; i++) {
+                const float *lg = gp_logits + i*POLICY_DIM;
+                const float *vm = gp_vm + i*POLICY_DIM;
+                float mx = -1e30f;
+                float p[POLICY_DIM], s_val = 0;
+                float inv_temp = 1.0f / opp_temperature;
+                for (int j = 0; j < POLICY_DIM; j++) {
+                    float ml = vm[j] > 0.5f ? lg[j] * inv_temp : -1e8f;
+                    if (ml > mx) mx = ml;
+                    p[j] = ml;
+                }
+                for (int j = 0; j < POLICY_DIM; j++) { p[j] = expf(p[j]-mx); s_val += p[j]; }
+                for (int j = 0; j < POLICY_DIM; j++) p[j] /= s_val;
+
+                float r = rng_float();
+                float cum = 0;
+                int action = POLICY_DIM - 1;
+                for (int j = 0; j < POLICY_DIM; j++) { cum += p[j]; if (r < cum) { action = j; break; } }
+
+                int gi = opp_idx[i];
+                int col = action;
+                int row = col_height_buf[gi*BOARD_COLS + col];
+                board_buf[gi*BOARD_SIZE + row*BOARD_COLS + col] = cplayer_buf[gi];
+                col_height_buf[gi*BOARD_COLS + col]++;
+                move_col[gi] = col;
+            }
+        }
+
+        for (int i = 0; i < num_games; i++) {
+            if (done_buf_g[i]) continue;
+            int col = move_col[i];
+            int row = col_height_buf[i*BOARD_COLS + col] - 1;
+            float cp = cplayer_buf[i];
+            if (check_win_at(board_buf + i*BOARD_SIZE, row, col, cp)) {
+                done_buf_g[i] = 1;
+                winner_buf[i] = cp;
+                games_remaining--;
+            } else {
+                int full = 1;
+                int *ch = col_height_buf + i*BOARD_COLS;
+                for (int c = 0; c < BOARD_COLS; c++)
+                    if (ch[c] < BOARD_ROWS) { full = 0; break; }
+                if (full) {
+                    done_buf_g[i] = 1;
+                    winner_buf[i] = 0;
+                    games_remaining--;
+                }
+            }
+        }
+
+        for (int i = 0; i < num_games; i++)
+            if (!done_buf_g[i])
+                cplayer_buf[i] *= -1.0f;
+    }
+
+    /* Output transitions in game order */
+    int out_idx = 0;
+    int wins = 0, draws = 0, losses = 0;
+    memset(out_rewards, 0, trans_count * sizeof(float));
+    memset(out_dones, 0, trans_count * sizeof(float));
+
+    for (int g = 0; g < num_games; g++) {
+        float ap = agent_player_buf[g];
+        float w = winner_buf[g];
+        float reward;
+        if (w == ap) { reward = 1.0f; wins++; }
+        else if (w == 0) { reward = draw_reward; draws++; }
+        else { reward = -1.0f; losses++; }
+
+        int n_moves = game_trans_count[g];
+        for (int m = 0; m < n_moves; m++) {
+            int src = game_trans_idx[g][m];
+            memcpy(out_obs + out_idx*INPUT_DIM, tmp_obs + src*INPUT_DIM, INPUT_DIM*sizeof(float));
+            out_actions[out_idx] = tmp_actions[src];
+            out_log_probs[out_idx] = tmp_log_probs[src];
+            out_values[out_idx] = tmp_values[src];
+            memcpy(out_valid_masks + out_idx*POLICY_DIM, tmp_valid_masks + src*POLICY_DIM, POLICY_DIM*sizeof(float));
+
+            if (m == n_moves - 1) {
+                out_rewards[out_idx] = reward;
+                out_dones[out_idx] = 1.0f;
+            }
+            out_trans_game_idx[out_idx] = g;
+            out_idx++;
+        }
+    }
+
+    out_game_results[0] = wins;
+    out_game_results[1] = draws;
+    out_game_results[2] = losses;
+
+    return trans_count;
+}
